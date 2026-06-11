@@ -1,6 +1,5 @@
 #include "plant_logic.h"
 #include "s2.h"
-#include "s8.h"
 #include "s5.h"
 #include "s6.h"
 #include "s7.h"
@@ -18,8 +17,8 @@
 system_state_t g_sys;
 
 /* ==================== I2C 地址 (全局唯一实例) ==================== */
-static i2c_addr_def g_s2_addr;      // BH1750 光照 (S2)
-static i2c_addr_def g_s8_addr;      // SHT35 温湿度 (S8)
+// S2 三合一传感器板: th_addr(SHT35温湿度) + ss_addr(BH1750光照) + ax_addr(ICM20608)
+static s2_addr_def g_s2_addr;
 static i2c_addr_def g_s5_addr;      // MS523 NFC (S5)
 static i2c_addr_def g_s6_addr;      // 超声波 (S6)
 static i2c_addr_def g_s7_addr;      // 人体红外 (S7)
@@ -98,11 +97,8 @@ void plant_logic_init(void) {
     g_sys.vision_ready = 0;
 
     // 初始化所有硬件
-    // S2: 光照 (BH1750)
-    g_s2_addr = s2_init(BH1750_ADDRESS_S2);
-
-    // S8: 温湿度 (SHT35)
-    g_s8_addr = s8_init(SHT35_ADDRESS_S8);
+    // S2: 三合一传感器板 (SHT35温湿度 + BH1750光照 + ICM20608 6轴)
+    s2_all_init(&g_s2_addr, TH_ADDRESS_S2, S1_ADDRESS_S2, AX_ADDRESS_S2);
 
     // S5: NFC (MS523)
     g_s5_addr = get_board_address(MS523_ADDRESS_S5);
@@ -162,16 +158,17 @@ void plant_logic_init(void) {
 /* ==================== 传感器读取 ==================== */
 
 void sensors_read(void) {
-    // 读取温湿度 (S8: SHT35)
-    if (g_s8_addr.flag) {
-        s8_get_temp_humi(g_s8_addr.periph, g_s8_addr.addr,
+    // 读取温湿度 (S2板上的SHT35)
+    if (g_s2_addr.th_addr.flag) {
+        s2_get_temp_humi(g_s2_addr.th_addr.periph, g_s2_addr.th_addr.addr,
                          &g_sys.sensor.temperature,
                          &g_sys.sensor.humidity);
     }
 
-    // 读取光照 (S2: BH1750)
-    if (g_s2_addr.flag) {
-        g_sys.sensor.light = s2_get_light(g_s2_addr.periph, g_s2_addr.addr);
+    // 读取光照 (S2板上的BH1750)
+    if (g_s2_addr.ss_addr.flag) {
+        g_sys.sensor.light = s2_read_bh1750_value(g_s2_addr.ss_addr.periph,
+                                                   g_s2_addr.ss_addr.addr);
     }
 
     // 读取超声波距离 (S6)
