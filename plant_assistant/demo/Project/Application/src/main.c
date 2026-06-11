@@ -1,316 +1,250 @@
 #include "gd32f4xx.h"
-#include "i2c.h"
 #include "systick.h"
+#include "i2c.h"
 #include "uart.h"
-#include "e1.h"
-#include "e2.h"
-#include "s2.h"
+#include "main.h"
+#include "plant_logic.h"
 #include "s1.h"
+#include "c2.h"
 #include "c3.h"
-#include "../Application/inc/plant_logic.h"
-#include "../Application/inc/main.h"
-#include <stdio.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-/* ========================== 全局设备地址 ========================== */
-i2c_addr_def s2_th_addr;      // SHT35 温湿度传感器 (I2C:0x44)
-i2c_addr_def s2_ss_addr;      // BH1750 光照传感器 (I2C:0x23)
-i2c_addr_def e1_rgb_addr;     // PCA9685 RGB (I2C:0x40)
-i2c_addr_def e1_nixie_addr;   // HT16K33 数码管 (I2C:0x70)
-i2c_addr_def e2_fan_addr;     // PCA9685 风扇 (I2C:0x60)
-i2c_addr_def s1_key_addr;     // S1按键 (I2C:0x24)
-i2c_addr_def u2p_vision_addr; // u2p_vision (I2C:0x30)
+/* ==================== UART 端口分配 ==================== */
+// UART0  (PA9/PA10):  C3 WiFi 模块 + 调试串口(前端控制)  [由 uart.c 管理]
+// USART1 (PA2/PA3):   u2p_vision 视觉识别通信            [由 main.c 管理]
+// USART2 (PC10/PC11): C2 Zigbee 模块                    [由 c2.c 管理]
 
-/* ========================== 系统状态标志 ========================== */
-volatile uint32_t sys_tick_1s = 0;     // 1秒计数器 (每50ms+1, 到20即为1秒)
-volatile uint32_t sys_tick_50ms = 0;   // 50ms tick 触发
-volatile uint32_t uart_recv_tick = 0;  // UART 接收标记
+/* ==================== 全局变量 ==================== */
+static key_state_t g_key_state;
 
-/* u2p_vision 通讯变量 */
-char vision_name[32] = {0};
-float vision_score = 0.0f;
-uint8_t vision_data_ready = 0;
+/* ==================== USART1 初始化 (u2p_vision 视觉识别) ==================== */
+static void usart1_init(void) {
+    rcu_periph_clock_enable(RCU_GPIOA);
+    rcu_periph_clock_enable(RCU_USART1);
 
-/* WiFi 连接状态 */
-int wifi_run_state = 1;
-int tcp_status = -1;
+    gpio_af_set(GPIOA, GPIO_AF_7, GPIO_PIN_2 | GPIO_PIN_3);
+    gpio_mode_set(GPIOA, GPIO_MODE_AF, GPIO_PUPD_PULLUP, GPIO_PIN_2 | GPIO_PIN_3);
+    gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_2 | GPIO_PIN_3);
 
-/* 按键防抖变量 */
-uint16_t key_debounce_cnt = 0;
-uint8_t  key_last_state = 1;
+    usart_deinit(USART1);
+    usart_baudrate_set(USART1, 115200U);
+    usart_word_length_set(USART1, USART_WL_8BIT);
+    usart_stop_bit_set(USART1, USART_STB_1BIT);
+    usart_parity_config(USART1, USART_PM_NONE);
+    usart_hardware_flow_rts_config(USART1, USART_RTS_DISABLE);
+    usart_hardware_flow_cts_config(USART1, USART_CTS_DISABLE);
+    usart_receive_config(USART1, USART_RECEIVE_ENABLE);
+    usart_transmit_config(USART1, USART_TRANSMIT_ENABLE);
+    usart_enable(USART1);
 
-/* ========================== 硬件初始化 ========================== */
+    nvic_irq_enable(USART1_IRQn, 2, 2);
+    usart_interrupt_enable(USART1, USART_INT_RBNE);
+}
 
-void system_init(void) {
-    // 基础时钟配置
-    rcu_config();
+/* ==================== UART 发送辅助函数 ==================== */
+void usart_send_string(uint32_t usart_periph, char *str) {
+    while (*str) {
+        while (usart_flag_get(usart_periph, USART_FLAG_TBE) == RESET);
+        usart_data_transmit(usart_periph, (uint8_t)*str++);
+    }
+}
 
-    // Systick (提供给 delay_ms)
-    systick_config();
+/* ==================== USART1 接收中断 (u2p_vision) ==================== */
+static char g_vision_rx_buf[128];
+static uint8_t g_vision_rx_idx;
 
-    // I2C (PB8/9=I2C0, PF0/1=I2C1)
+void USART1_IRQHandler(void) {
+    if (usart_interrupt_flag_get(USART1, USART_INT_FLAG_RBNE) != RESET) {
+        uint8_t ch = usart_data_receive(USART1);
+        if (ch == '\r' || ch == '\n') {
+            if (g_vision_rx_idx > 0) {
+                g_vision_rx_buf[g_vision_rx_idx] = '\0';
+                // 解析 VISION:plant_id,plant_name
+                if (strncmp(g_vision_rx_buf, "VISION:", 7) == 0) {
+                    int id = atoi(&g_vision_rx_buf[7]);
+                    if (id >= 1 && id <= MAX_PLANTS) {
+                        g_sys.vision_plant_id = (uint8_t)id;
+                        g_sys.vision_ready = 1;
+                    }
+                }
+                g_vision_rx_idx = 0;
+            }
+        } else if (g_vision_rx_idx < sizeof(g_vision_rx_buf) - 1) {
+            g_vision_rx_buf[g_vision_rx_idx++] = (char)ch;
+        }
+    }
+}
+
+/* ==================== 前端命令处理 ==================== */
+static void frontend_process(void) {
+    char line[128];
+    uint16_t len;
+    // 逐行提取并处理
+    while ((len = uart_get_line(line, sizeof(line))) > 0) {
+        if (len > 0) {
+            uart_command_parse((uint8_t*)line);
+        }
+    }
+}
+
+/* ==================== 硬件初始化 ==================== */
+void device_init(void) {
+    // I2C 初始化
     init_i2c();
 
-    // UART0 (PA9/PA10) = C3 WiFi, UART2 (PC10/PC11) = u2p_vision
-    uart_init(USART0);
-    uart_init(USART2);
-
-    // Timer3 1ms基准
+    // Timer3 1ms 定时器 (uart.c 需要)
     timer3_init();
 
-    // 延时确保外设稳定
-    delay_ms(100);
-}
+    // UART0: C3 WiFi + 调试串口 (由 uart.c 管理中断)
+    uart_init(USART0);
 
-void device_init(void) {
-    // 扫描所有I2C设备
-    s2_th_addr      = get_board_address(0x44);   // SHT35
-    s2_ss_addr      = get_board_address(0x23);   // BH1750
-    e1_rgb_addr     = get_board_address(0x40);   // PCA9685 RGB
-    e1_nixie_addr   = get_board_address(0x70);   // HT16K33
-    e2_fan_addr     = get_board_address(0x60);   // PCA9685 Fan
-    s1_key_addr     = get_board_address(0x24);   // S1 Button
-    u2p_vision_addr = get_board_address(0x30);   // u2p_vision
+    // USART1: u2p_vision 视觉识别
+    usart1_init();
 
-    // 初始化传感器
-    if (s2_th_addr.flag) s2_th_init(s2_th_addr.periph, s2_th_addr.addr);
-    if (s2_ss_addr.flag) s2_ss_init(s2_ss_addr.periph, s2_ss_addr.addr);
-
-    // 初始化执行器
-    if (e1_rgb_addr.flag) {
-        e1_rgb_init(e1_rgb_addr.periph, e1_rgb_addr.addr);
-        e1_rgb_set(e1_rgb_addr.periph, e1_rgb_addr.addr, 0, 0, 0);
-    }
-    if (e1_nixie_addr.flag) {
-        e1_nixie_init(e1_nixie_addr.periph, e1_nixie_addr.addr);
-    }
-    if (e2_fan_addr.flag) {
-        e2_fan_init(e2_fan_addr.periph, e2_fan_addr.addr);
-    }
-
-    // 初始化按键
-    if (s1_key_addr.flag) s1_key_init(s1_key_addr.periph, s1_key_addr.addr);
-
-    // 初始化WiFi
+    // 初始化 C3 WiFi 模块
     c3_init();
 
-    // 初始化植物逻辑
+    // 初始化植物助手逻辑 (含所有传感器/执行器/C2 Zigbee)
     plant_logic_init();
+
+    // 启动提示
+    usart_send_string(USART0, "\r\n================================\r\n");
+    usart_send_string(USART0, " Xiaomi AIoT Plant Assistant\r\n");
+    usart_send_string(USART0, "================================\r\n");
+    usart_send_string(USART0, "Type HELP for command list\r\n");
+    usart_send_string(USART0, "================================\r\n\r\n");
 }
 
-/* ========================== 1哨(1秒) 任务循环 ========================== */
-
-void task_1s_loop(void) {
-    // 1. 读取传感器数据
-    if (s2_th_addr.flag) {
-        s2_get_temp_humi(s2_th_addr.periph, s2_th_addr.addr,
-                         &current_env.temperature, &current_env.humidity);
-    }
-    if (s2_ss_addr.flag) {
-        current_env.light = s2_get_light(s2_ss_addr.periph, s2_ss_addr.addr);
-    }
-
-    // 2. 计算评分
-    calc_score();
-
-    // 3. 更新蒸发指数 & 浇水提醒
-    update_evaporation();
-    check_water_alert();
-
-    // 4. 自动遮阳
-    auto_curtain();
-
-    // 5. 自动通风
-    auto_fan();
-
-    // 6. WiFi 连接状态机
-    c3_wifi_tcp_lead(&wifi_run_state, &tcp_status);
-
-    // 7. 视觉融合
-    if (vision_data_ready) {
-        vision_data_ready = 0;
-        u1p_fusion_decision(vision_name, vision_score);
-    }
-
-    // 8. 更新显示与RGB
-    update_display();
-}
-
-/* ========================== 显示更新 ========================== */
-
-void update_display(void) {
-    static uint8_t disp_prev_mode = 0xFF;
-    static uint32_t disp_slice_tick = 0;
-
-    disp_slice_tick++;
-
-    // 模式切换时强制刷新
-    if (disp_prev_mode != sys_ctrl.display_mode) {
-        disp_prev_mode = sys_ctrl.display_mode;
-        disp_slice_tick = 0;
-    }
-
-    switch (sys_ctrl.display_mode) {
-        case 0:  // 综合评分
-            display_score();
-            set_rgb_by_score(current_env.score);
+/* ==================== 按键处理 ==================== */
+static void key_handle(uint8_t key) {
+    switch (key) {
+        case KEY_1:
+            plant_switch(0);
             break;
-        case 1:  // 温度
-            display_temperature_ui();
+        case KEY_2:
+            plant_switch(1);
             break;
-        case 2:  // 湿度
-            display_humidity_ui();
+        case KEY_3:
+            plant_switch(2);
             break;
-        case 3:  // 光照（RGB=自然白色）
-            display_light();
-            set_rgb_color(40, 40, 40);
+        case KEY_4:
+            plant_switch_next();
             break;
-        default:
-            break;
-    }
-
-    // 根据评分切换RGB
-    set_rgb_by_score(current_env.score);
-}
-
-/* ========================== 按键处理 ========================== */
-
-void process_key(void) {
-    if (!s1_key_addr.flag) return;
-
-    uint8_t key_code = s1_key_scan(s1_key_addr.periph, s1_key_addr.addr);
-    key_code &= 0x0F;  // 低4位
-
-    if (key_code == 0) {
-        key_last_state = 0;
-        key_debounce_cnt = 0;
-        return;
-    }
-
-    // 消抖处理
-    if (key_code == key_last_state) {
-        key_debounce_cnt++;
-        if (key_debounce_cnt < 5) return;  // 50ms消抖
-    } else {
-        key_last_state = key_code;
-        key_debounce_cnt = 0;
-        return;
-    }
-
-    // 按键处理
-    switch (key_code) {
-        case 0x01:  // 按键1: 切换显示模式
-            sys_ctrl.display_mode = (sys_ctrl.display_mode + 1) % 4;
-            key_debounce_cnt = 0;
-            key_last_state = 0;
-            break;
-
-        case 0x02:  // 按键2: 切换植物
-            switch_plant();
-            key_debounce_cnt = 0;
-            key_last_state = 0;
-            break;
-
-        case 0x04:  // 按键3: 手动开/关自动遮阳
-            sys_ctrl.auto_curtain_enabled = !sys_ctrl.auto_curtain_enabled;
-            key_debounce_cnt = 0;
-            key_last_state = 0;
-            break;
-
-        case 0x08:  // 按键4: 手动开/关自动通风
-            sys_ctrl.auto_fan_enabled = !sys_ctrl.auto_fan_enabled;
-            if (!sys_ctrl.auto_fan_enabled && e2_fan_addr.flag) {
-                e2_fan_off(e2_fan_addr.periph, e2_fan_addr.addr);
-                actuators.fan_state = 0;
+        case KEY_5:
+            g_sys.actuator.auto_mode = !g_sys.actuator.auto_mode;
+            if (g_sys.actuator.auto_mode) {
+                g_sys.actuator.fan_auto = 1;
+                g_sys.actuator.curtain_auto = 1;
             }
-            key_debounce_cnt = 0;
-            key_last_state = 0;
+            usart_send_string(USART0, g_sys.actuator.auto_mode ? "AUTO:ON\r\n" : "AUTO:OFF\r\n");
             break;
-
+        case KEY_6:
+            if (g_sys.actuator.curtain_pos == 0) {
+                g_sys.actuator.curtain_auto = 0;
+                g_sys.actuator.curtain_pos = 100;
+                usart_send_string(USART0, "CURTAIN:CLOSE\r\n");
+            } else {
+                g_sys.actuator.curtain_auto = 0;
+                g_sys.actuator.curtain_pos = 0;
+                usart_send_string(USART0, "CURTAIN:OPEN\r\n");
+            }
+            break;
+        case KEY_7:
+            g_sys.actuator.fan_auto = 0;
+            if (g_sys.actuator.fan_speed == 0) {
+                g_sys.actuator.fan_speed = 100;
+                usart_send_string(USART0, "FAN:ON\r\n");
+            } else {
+                g_sys.actuator.fan_speed = 0;
+                usart_send_string(USART0, "FAN:OFF\r\n");
+            }
+            break;
+        case KEY_8:
+            zigbee_send_status();
+            usart_send_string(USART0, "ZIGBEE:Status sent\r\n");
+            break;
         default:
-            key_last_state = 0;
-            key_debounce_cnt = 0;
             break;
     }
 }
 
-/* ========================== UART 命令解析 (u2p_vision & 调试) ========================== */
+/* ==================== WiFi 连接状态机 ==================== */
+static int g_wifi_run_state = 1;
+static int g_tcp_status = -1;
 
-void parse_uart_commands(void) {
-    static uint8_t uart2_buf[128];
-    static uint16_t uart2_len = 0;
-
-    // 从USART2接收视觉数据
-    int16_t recv = uart_rece_bytes(USART2, uart2_buf, sizeof(uart2_buf), 5);
-    if (recv > 0) {
-        uart2_buf[recv] = 0;
-
-        // u2p_vision: "NAME:xxx SCORE:0.x"
-        char* name_start = strstr((char*)uart2_buf, "NAME:");
-        char* score_start = strstr((char*)uart2_buf, "SCORE:");
-        if (name_start && score_start) {
-            name_start += 5;
-            score_start += 6;
-            sscanf(name_start, "%31s", vision_name);
-            vision_score = (float)atof(score_start);
-            vision_data_ready = 1;
-        }
-    }
-
-    // 从USART0接收调试命令
-    static uint8_t uart0_buf[64];
-    int16_t recv0 = uart_rece_bytes(USART0, uart0_buf, sizeof(uart0_buf), 5);
-    if (recv0 > 0) {
-        uart0_buf[recv0] = 0;
-
-        // 调试命令: "TEMP?" "HUMI?" "LIGHT?" "SCORE?"
-        if (strstr((char*)uart0_buf, "TEMP?")) {
-            char resp[32];
-            snprintf(resp, sizeof(resp), "TEMP:%.1f\r\n", current_env.temperature);
-            uart_send_bytes(USART0, (uint8_t*)resp, strlen(resp));
-        } else if (strstr((char*)uart0_buf, "HUMI?")) {
-            char resp[32];
-            snprintf(resp, sizeof(resp), "HUMI:%.1f\r\n", current_env.humidity);
-            uart_send_bytes(USART0, (uint8_t*)resp, strlen(resp));
-        } else if (strstr((char*)uart0_buf, "LIGHT?")) {
-            char resp[32];
-            snprintf(resp, sizeof(resp), "LIGHT:%.1f\r\n", current_env.light);
-            uart_send_bytes(USART0, (uint8_t*)resp, strlen(resp));
-        } else if (strstr((char*)uart0_buf, "SCORE?")) {
-            char resp[64];
-            snprintf(resp, sizeof(resp), "SCORE:%d T:%d H:%d L:%d\r\n",
-                     current_env.score, current_env.temp_score,
-                     current_env.humi_score, current_env.light_score);
-            uart_send_bytes(USART0, (uint8_t*)resp, strlen(resp));
-        }
-    }
-}
-
-/* ========================== 主循环 ========================== */
-
+/* ==================== 主循环 ==================== */
 int main(void) {
-    // 硬件初始化
-    system_init();
+    uint32_t tick = 0;
+    uint32_t last_zigbee_send = 0;
+    uint32_t last_nfc_scan = 0;
+
+    // 初始化系统
+    systick_config();
     device_init();
 
-    // 主循环标志
     while (1) {
-        // 50ms Tick 由 SysTick/Timer3 中断触发
-        if (sys_tick_50ms) {
-            sys_tick_50ms = 0;
-            sys_tick_1s++;
+        tick++;
 
-            // 按键扫描 (50ms周期)
-            process_key();
+        /* --- 每 10ms 检查前端命令 --- */
+        frontend_process();
 
-            // UART 命令解析
-            parse_uart_commands();
-
-            // 1秒到 → 执行1哨任务
-            if (sys_tick_1s >= 20) {
-                sys_tick_1s = 0;
-                task_1s_loop();
+        /* --- 每 50ms 执行 --- */
+        if (tick % 5 == 0) {
+            uint8_t key = s1_key_scan(I2C0, HT16K33_KEY_ADDRESS_S1, &g_key_state);
+            if (key != KEY_NONE) {
+                key_handle(key);
             }
         }
+
+        /* --- 每秒执行 --- */
+        if (tick % 100 == 0) {
+            // WiFi 连接状态机
+            c3_wifi_tcp_lead(&g_wifi_run_state, &g_tcp_status);
+
+            // 读取传感器
+            sensors_read();
+
+            // 计算评分
+            score_calculate();
+
+            // 更新显示
+            display_update();
+            rgb_update();
+
+            // 自动控制
+            auto_shade_control();
+            auto_vent_control();
+            auto_light_control();
+
+            // 蒸发指数
+            evaporation_update();
+
+            // 浇水提醒检查
+            watering_check();
+
+            // 视觉识别结果处理
+            vision_uart_process();
+
+            // Zigbee 接收处理
+            zigbee_recv_process();
+
+            // 每10秒发送一次 Zigbee 状态
+            last_zigbee_send++;
+            if (last_zigbee_send >= 10) {
+                zigbee_send_status();
+                last_zigbee_send = 0;
+            }
+
+            // 每2秒扫描一次 NFC
+            last_nfc_scan++;
+            if (last_nfc_scan >= 2) {
+                nfc_card_process();
+                last_nfc_scan = 0;
+            }
+        }
+
+        delay_1ms(10);
     }
 }

@@ -1,39 +1,28 @@
 #ifndef S2_H
 #define S2_H
 
-#include "gd32f4xx.h"
-#include "plant_logic.h"
+#include "i2c.h"
 
-/* ========================== S2 传感器地址 ========================== */
-#define TH_ADDRESS_S2             0x88   // SHT35 温湿度
-#define S1_ADDRESS_S2             0x46   // BH1750 光照
-#define S2_ADDRESS_S2             0xB8   // 备选BH1750地址
+#define out
+#define BH1750_ADDRESS_S2           0x46    // 7位地址0x23, 左移后0x46 (拨码开关可调: 0x46,0x48,0x4A,0x4C)
 
-/* ========================== 传感器数据结构体 ========================== */
+// BH1750 命令
+#define BH1750_POWER_ON             0x01
+#define BH1750_POWER_OFF            0x00
+#define BH1750_RESET                0x07
+#define BH1750_CONT_H_MODE          0x10    // 连续高分辨率模式 1lux精度
+#define BH1750_CONT_H_MODE2         0x11    // 连续高分辨率模式2 0.5lux精度
+#define BH1750_CONT_L_MODE          0x13    // 连续低分辨率模式 4lux精度
+#define BH1750_ONE_H_MODE           0x20    // 单次高分辨率模式
+#define BH1750_ONE_H_MODE2          0x21    // 单次高分辨率模式2
+#define BH1750_ONE_L_MODE           0x22    // 单次低分辨率模式
+
 typedef struct {
-    float temperature;
-    float humidity;
-} s2_th_para;
-
-typedef struct {
-    i2c_addr_def th_addr;    // 温湿度传感器地址
-    i2c_addr_def ss_addr;    // 光照传感器地址
+    i2c_addr_def light_addr[4];
 } s2_addr_def;
 
-/* ========================== 函数声明 ========================== */
-i2c_addr_def s2_init_sht35(uint8_t address);
-i2c_addr_def s2_init_bh1750_dev(uint8_t address);
-void s2_all_init(s2_addr_def* s2_addr, uint8_t th_addr, uint8_t ss_addr);
-
-// SHT35 温湿度传感器
-void s2_sht35_soft_reset(uint32_t i2c_periph, uint8_t i2c_addr);
-s2_th_para s2_read_sht35(uint32_t i2c_periph, uint8_t i2c_addr);
-
-// BH1750 光照传感器
-void s2_bh1750_init(uint32_t i2c_periph, uint8_t i2c_addr);
-float s2_read_bh1750(uint32_t i2c_periph, uint8_t i2c_addr);
-
-// CRC校验
-uint8_t s2_sht35_crc_cal(uint16_t dat);
+i2c_addr_def s2_init(uint8_t address);
+void s2_all_init(s2_addr_def *s2_address, uint8_t s2_addr);
+float s2_get_light(uint32_t i2c_periph, uint8_t i2c_addr);
 
 #endif // S2_H

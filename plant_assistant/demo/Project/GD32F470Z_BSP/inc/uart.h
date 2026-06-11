@@ -20,9 +20,13 @@ void delay_ms(uint16_t mstime);
 uint16_t uart_send_bytes(uint32_t usart_periph, uint8_t* data, uint16_t len);
 uint16_t uart_rece_bytes(uint32_t usart_periph, uint8_t* data, uint16_t len, uint16_t timeout);
 
-/* ========================== 中断服务函数 ========================== */
+/* ========================== 前端命令提取 ========================== */
+uint16_t uart_get_line(char *line_buf, uint16_t max_len);
+
+/* ========================== Timer3 中断 (1ms) ========================== */
 void TIMER3_IRQHandler(void);
+
+/* ========================== UART0 中断 ========================== */
 void USART0_IRQHandler(void);
-void USART2_IRQHandler(void);
 
 #endif // UART_H

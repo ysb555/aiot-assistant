@@ -169,3 +169,16 @@ void c3_send_water_alert(const char* plant_name) {
              WATER_ALERT_PATH, plant_name, SERVER_IP, SERVER_PORT);
     c3_wifi_tcp_send(http_request);
 }
+
+/**
+ * 发送通用 HTTP GET 请求 (完整版 - 带自定义查询参数)
+ * path:        请求路径 (如 "/api/water_alert")
+ * query_params: 查询参数字符串 (如 "plant=绿萝&temp=25.0&humi=60.0")
+ */
+void c3_send_http_get(const char* path, const char* query_params) {
+    char http_request[512];
+    snprintf(http_request, sizeof(http_request),
+             "GET %s?%s HTTP/1.1\r\nHost: %s:%s\r\nConnection: close\r\n\r\n",
+             path, query_params, SERVER_IP, SERVER_PORT);
+    c3_wifi_tcp_send(http_request);
+}
