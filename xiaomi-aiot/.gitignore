@@ -1,0 +1,6 @@
+*.docx
+.vscode
+Objects
+.DS_Store
+*.uvguix.*
+*.zip
